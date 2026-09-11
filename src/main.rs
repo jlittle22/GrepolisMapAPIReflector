@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::Path,
-    http::{Response, StatusCode},
+    http::{HeaderValue, Method, Response, StatusCode},
     response::IntoResponse,
     routing::get,
     Extension, Router,
@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{fs, sync::RwLock};
+use tower_http::cors::CorsLayer;
 use tracing::info;
 
 const CACHE_EXPIRY: Duration = Duration::from_secs(15 * 60); // 15 minutes
@@ -42,10 +43,17 @@ async fn main() {
     // Build our application with a route
     let app = Router::new()
         .route("/{server}/{datafile}", get(handle_request))
+        .layer(
+            CorsLayer::new()
+                .allow_origin("https://map.grasstouchers.gg".parse::<HeaderValue>().unwrap())
+                .allow_methods([Method::GET]),
+        )
         .layer(Extension(app_state));
 
     // run our app with hyper, listening globally on port 3000
-    let listen_address = "[::]:3000";
+    // Cloud Run's default (gVisor) sandbox doesn't support binding the IPv6
+    // wildcard address, so bind IPv4-only.
+    let listen_address = "0.0.0.0:3000";
     info!("listening on {listen_address}");
     let listener = tokio::net::TcpListener::bind(listen_address)
         .await
