@@ -1,28 +1,36 @@
 #![warn(clippy::pedantic)]
 
+mod archive;
+
+use archive::Archive;
 use axum::{
     body::Body,
-    extract::Path,
-    http::{HeaderValue, Method, Response, StatusCode},
+    extract::{Path, Query},
+    http::{header, HeaderValue, Method, Response, StatusCode},
     response::IntoResponse,
     routing::get,
-    Extension, Router,
+    Extension, Json, Router,
 };
 use bytes::Bytes;
 use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest::{redirect::Policy, Client};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{fs, sync::RwLock};
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 const CACHE_EXPIRY: Duration = Duration::from_secs(15 * 60); // 15 minutes
+/// `/capture` refetches anything older than this. With the normal 15 minute expiry, a
+/// scheduler pinging every 15 minutes would often find the cache just barely fresh and
+/// only actually capture on every other ping.
+const CAPTURE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 const MAX_FILES_IN_RAM_CACHE: usize = 25;
 lazy_static! {
     static ref SERVER_REGEX: Regex = Regex::new(r"^[a-zA-Z]{2}\d{1,3}$").unwrap();
@@ -42,6 +50,8 @@ async fn main() {
 
     // Build our application with a route
     let app = Router::new()
+        .route("/{server}/history", get(handle_history))
+        .route("/{server}/capture", get(handle_capture))
         .route("/{server}/{datafile}", get(handle_request))
         .layer(
             CorsLayer::new()
@@ -51,8 +61,6 @@ async fn main() {
         .layer(Extension(app_state));
 
     // run our app with hyper, listening globally on port 3000
-    // Cloud Run's default (gVisor) sandbox doesn't support binding the IPv6
-    // wildcard address, so bind IPv4-only.
     let listen_address = "0.0.0.0:3000";
     info!("listening on {listen_address}");
     let listener = tokio::net::TcpListener::bind(listen_address)
@@ -68,6 +76,7 @@ struct AppState {
     failed_cache: RwLock<HashMap<String, Instant>>,
     client: Client,
     cache_dir: PathBuf,
+    archive: Option<Archive>,
 }
 
 impl AppState {
@@ -83,11 +92,19 @@ impl AppState {
         // Set up the cache directory
         let cache_dir = "./cache".into();
         fs::create_dir_all(&cache_dir).await.unwrap();
+        let archive = std::env::var_os("SNAPSHOT_DIR").map(|dir| {
+            info!("archiving snapshots to {}", dir.to_string_lossy());
+            Archive::new(dir.into())
+        });
+        if archive.is_none() {
+            info!("SNAPSHOT_DIR not set, snapshot archiving disabled");
+        }
         Self {
             cache: RwLock::new(HashMap::new()),
             failed_cache: RwLock::new(HashMap::new()),
             client,
             cache_dir,
+            archive,
         }
     }
 }
@@ -97,8 +114,20 @@ struct CacheEntry {
     timestamp: Instant,
 }
 
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    at: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct History {
+    server: String,
+    snapshots: Vec<u64>,
+}
+
 async fn handle_request(
     Path((server, datafile)): Path<(String, String)>,
+    Query(query): Query<SnapshotQuery>,
     Extension(state): Extension<Arc<AppState>>,
 ) -> Response<Body> {
     // Validate the server parameter
@@ -110,41 +139,147 @@ async fn handle_request(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    if let Some(at) = query.at {
+        return snapshot_at(&state, &server, &datafile, at).await;
+    }
+    match get_live(&state, &server, &datafile, CACHE_EXPIRY).await {
+        Ok(data) => (StatusCode::OK, data).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn handle_history(
+    Path(server): Path<String>,
+    Extension(state): Extension<Arc<AppState>>,
+) -> Response<Body> {
+    if !SERVER_REGEX.is_match(&server) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(archive) = &state.archive else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let snapshots = archive.timeline(&server).await;
+    Json(History { server, snapshots }).into_response()
+}
+
+async fn handle_capture(
+    Path(server): Path<String>,
+    Extension(state): Extension<Arc<AppState>>,
+) -> StatusCode {
+    if !SERVER_REGEX.is_match(&server) {
+        return StatusCode::NOT_FOUND;
+    }
+    let results = tokio::join!(
+        get_live(&state, &server, "players.txt", CAPTURE_MAX_AGE),
+        get_live(&state, &server, "alliances.txt", CAPTURE_MAX_AGE),
+        get_live(&state, &server, "towns.txt", CAPTURE_MAX_AGE),
+        get_live(&state, &server, "islands.txt", CAPTURE_MAX_AGE),
+    );
+    if [results.0, results.1, results.2, results.3]
+        .iter()
+        .all(Result::is_ok)
+    {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+/// Serve an archived version as-is; the stored gzip becomes the response's content encoding.
+async fn snapshot_at(state: &AppState, server: &str, datafile: &str, at: u64) -> Response<Body> {
+    let Some(archive) = &state.archive else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(version) = archive.at(server, datafile, at).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match archive.read_gz(&version).await {
+        Ok(gz) => (
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CONTENT_ENCODING, "gzip"),
+            ],
+            gz,
+        )
+            .into_response(),
+        Err(err) => {
+            warn!(result = "fail", reason = "archive read", %err, server, datafile);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn get_live(
+    state: &AppState,
+    server: &str,
+    datafile: &str,
+    max_age: Duration,
+) -> Result<Bytes, StatusCode> {
     let cache_key = format!("{server}/{datafile}");
 
     // Check if there is a cached failure
-    if let Some(failed_response) = get_from_failed_cache(&state, &cache_key).await {
+    if let Some(failed_response) = get_from_failed_cache(state, &cache_key).await {
         if failed_response.elapsed() < CACHE_EXPIRY {
             info!(result = "fail", reason = "cache", server, datafile);
-            return StatusCode::BAD_GATEWAY.into_response();
+            return Err(StatusCode::BAD_GATEWAY);
         }
     }
 
     // Check if response is cached in RAM
-    if let Some(data) = get_from_ram_cache(&state, &cache_key).await {
+    if let Some(data) = get_from_ram_cache(state, &cache_key, max_age).await {
         info!(result = "success", reason = "ram cache", server, datafile);
-        return (StatusCode::OK, data).into_response();
+        return Ok(data);
     }
     // Check if response is cached on disk
-    if let Some(data) = get_from_disk_cache(&state, &cache_key).await {
+    if let Some(data) = get_from_disk_cache(state, &cache_key, max_age).await {
         info!(result = "success", reason = "file cache", server, datafile);
-        update_ram_cache(&state, &cache_key, &data).await;
-        return (StatusCode::OK, data).into_response();
+        update_ram_cache(state, &cache_key, &data).await;
+        return Ok(data);
     }
     // Fetch from the external API
-    if let Some(data) = fetch_and_cache(&state, &server, &datafile, &cache_key).await {
-        info!(result = "success", reason = "upstream", server, datafile);
-        (StatusCode::OK, data).into_response()
-    } else {
+    let Some((data, last_modified)) = fetch_upstream(state, server, datafile).await else {
+        update_failed_cache(state, &cache_key).await;
         info!(result = "fail", reason = "upstream", server, datafile);
-        StatusCode::BAD_GATEWAY.into_response()
-    }
+        return Err(StatusCode::BAD_GATEWAY);
+    };
+    let data = archive_and_pick_newest(state, server, datafile, last_modified, data).await;
+    update_disk_cache(state, &cache_key, &data).await;
+    update_ram_cache(state, &cache_key, &data).await;
+    info!(result = "success", reason = "upstream", server, datafile);
+    Ok(data)
 }
 
-async fn get_from_ram_cache(state: &Arc<AppState>, cache_key: &str) -> Option<Bytes> {
+/// Upstream round-robins between nodes that regenerate at different times, so a fetch can
+/// return an older copy than one already archived. Never hand that older copy out.
+async fn archive_and_pick_newest(
+    state: &AppState,
+    server: &str,
+    datafile: &str,
+    last_modified: u64,
+    data: Bytes,
+) -> Bytes {
+    let Some(archive) = &state.archive else {
+        return data;
+    };
+    match archive.record(server, datafile, last_modified, &data).await {
+        Ok(outcome) => info!(archive = ?outcome, last_modified, server, datafile),
+        Err(err) => warn!(archive = "error", %err, server, datafile),
+    }
+    if let Some(newest) = archive.newest(server, datafile).await {
+        if newest.lm > last_modified {
+            match archive.read_plain(&newest).await {
+                Ok(newer) => return newer,
+                Err(err) => warn!(archive = "error", %err, server, datafile),
+            }
+        }
+    }
+    data
+}
+
+async fn get_from_ram_cache(state: &AppState, cache_key: &str, max_age: Duration) -> Option<Bytes> {
     let cache = state.cache.read().await;
     if let Some(entry) = cache.get(cache_key) {
-        if entry.timestamp.elapsed() < CACHE_EXPIRY {
+        if entry.timestamp.elapsed() < max_age {
             // Cache hit
             return Some(entry.data.clone());
         }
@@ -152,13 +287,13 @@ async fn get_from_ram_cache(state: &Arc<AppState>, cache_key: &str) -> Option<By
     None
 }
 
-async fn get_from_disk_cache(state: &Arc<AppState>, cache_key: &str) -> Option<Bytes> {
+async fn get_from_disk_cache(state: &AppState, cache_key: &str, max_age: Duration) -> Option<Bytes> {
     let cache_path = state.cache_dir.join(cache_key);
     if let Ok(metadata) = fs::metadata(&cache_path).await {
         if metadata.is_file() {
             if let Ok(modified) = metadata.modified() {
                 if let Ok(elapsed) = modified.elapsed() {
-                    if elapsed < CACHE_EXPIRY {
+                    if elapsed < max_age {
                         if let Ok(data) = fs::read(&cache_path).await {
                             return Some(Bytes::from(data));
                         }
@@ -170,47 +305,38 @@ async fn get_from_disk_cache(state: &Arc<AppState>, cache_key: &str) -> Option<B
     None
 }
 
-async fn get_from_failed_cache(state: &Arc<AppState>, cache_key: &str) -> Option<Instant> {
+async fn get_from_failed_cache(state: &AppState, cache_key: &str) -> Option<Instant> {
     let cache = state.failed_cache.read().await;
     cache.get(cache_key).copied()
 }
 
-async fn update_failed_cache(state: &Arc<AppState>, cache_key: &str) {
+async fn update_failed_cache(state: &AppState, cache_key: &str) {
     let mut cache = state.failed_cache.write().await;
     cache.insert(cache_key.to_string(), Instant::now());
 }
 
-async fn fetch_and_cache(
-    state: &Arc<AppState>,
-    server: &str,
-    datafile: &str,
-    cache_key: &str,
-) -> Option<Bytes> {
+/// Returns the body and upstream's `Last-Modified` in unix seconds (now, if absent).
+async fn fetch_upstream(state: &AppState, server: &str, datafile: &str) -> Option<(Bytes, u64)> {
     let url = format!("https://{server}.grepolis.com/data/{datafile}");
 
     // Perform the HTTP GET request with custom headers
-    let Ok(response) = state.client.get(&url).send().await else {
-        update_failed_cache(state, cache_key).await;
-        return None;
-    };
-
+    let response = state.client.get(&url).send().await.ok()?;
     if !response.status().is_success() {
-        update_failed_cache(state, cache_key).await;
         return None;
     }
-
-    let Ok(data) = response.bytes().await else {
-        update_failed_cache(state, cache_key).await;
-        return None;
-    };
-
-    // Update caches
-    update_disk_cache(state, cache_key, &data).await;
-    update_ram_cache(state, cache_key, &data).await;
-    Some(data)
+    let last_modified = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .unwrap_or_else(SystemTime::now)
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_secs());
+    let data = response.bytes().await.ok()?;
+    Some((data, last_modified))
 }
 
-async fn update_ram_cache(state: &Arc<AppState>, cache_key: &str, data: &Bytes) {
+async fn update_ram_cache(state: &AppState, cache_key: &str, data: &Bytes) {
     let mut cache = state.cache.write().await;
     // If the cache exceeds MAX_FILES_IN_RAM_CACHE, remove the least recently used entry
     if cache.len() >= MAX_FILES_IN_RAM_CACHE {
@@ -233,7 +359,7 @@ async fn update_ram_cache(state: &Arc<AppState>, cache_key: &str, data: &Bytes) 
     );
 }
 
-async fn update_disk_cache(state: &Arc<AppState>, cache_key: &str, data: &Bytes) {
+async fn update_disk_cache(state: &AppState, cache_key: &str, data: &Bytes) {
     let cache_path = state.cache_dir.join(cache_key);
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).await.ok();
