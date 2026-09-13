@@ -14,8 +14,9 @@ pub const ISLANDS_FILE: &str = "islands.txt";
 const TIMELINE_FILES: [&str; 3] = ["players.txt", "alliances.txt", "towns.txt"];
 /// Only the islands' town-count column changes between regenerations.
 const ISLANDS_MIN_INTERVAL_SECS: u64 = 24 * 60 * 60;
-/// An upstream node writes all of its files within a second or two of each other.
-const CLUSTER_SECS: u64 = 120;
+/// Players, alliances and towns are archived at most once per UTC slot of this length
+/// (00:00, 06:00, 12:00, 18:00), and the timeline has at most one point per slot.
+const SNAPSHOT_SLOT_SECS: u64 = 6 * 60 * 60;
 const LISTING_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,11 +82,15 @@ impl Archive {
         if existing.iter().any(|v| v.hash == hash) {
             return Ok(RecordOutcome::Duplicate);
         }
-        if file == ISLANDS_FILE
-            && existing
-                .last()
-                .is_some_and(|newest| lm.saturating_sub(newest.lm) < ISLANDS_MIN_INTERVAL_SECS)
-        {
+        let throttled = existing.last().is_some_and(|newest| {
+            if file == ISLANDS_FILE {
+                lm.saturating_sub(newest.lm) < ISLANDS_MIN_INTERVAL_SECS
+            } else {
+                // also rejects a copy older than the newest, e.g. from a lagging node
+                slot(lm) <= slot(newest.lm)
+            }
+        });
+        if throttled {
             return Ok(RecordOutcome::Throttled);
         }
 
@@ -205,6 +210,13 @@ fn resolve_at<'a>(versions: &'a [Version], file: &str, t: u64) -> Option<&'a Ver
     }
 }
 
+fn slot(lm: u64) -> u64 {
+    lm / SNAPSHOT_SLOT_SECS
+}
+
+/// One point per slot, stamped with the newest version in it. The files in a slot can come
+/// from different upstream nodes, up to an hour apart, and older archives hold hourly
+/// versions; stamping with the newest makes the point use each file's latest copy.
 fn timeline_points(per_file: &[Vec<Version>], has_islands: bool) -> Vec<u64> {
     if !has_islands {
         return Vec::new();
@@ -213,14 +225,10 @@ fn timeline_points(per_file: &[Vec<Version>], has_islands: bool) -> Vec<u64> {
     lms.sort_unstable();
 
     let mut points: Vec<u64> = Vec::new();
-    let mut cluster_start = None;
     for lm in lms {
-        match cluster_start {
-            Some(start) if lm - start <= CLUSTER_SECS => *points.last_mut().unwrap() = lm,
-            _ => {
-                cluster_start = Some(lm);
-                points.push(lm);
-            }
+        match points.last_mut() {
+            Some(last) if slot(*last) == slot(lm) => *last = lm,
+            _ => points.push(lm),
         }
     }
     points.retain(|&p| per_file.iter().all(|versions| versions.iter().any(|v| v.lm <= p)));
@@ -277,24 +285,27 @@ mod tests {
         assert_eq!(versions, vec![v(T0513_01, "aa"), v(T0513_02, "bb")]);
     }
 
+    const SLOT: u64 = SNAPSHOT_SLOT_SECS;
+
     #[test]
-    fn timeline_clusters_one_nodes_files_into_one_point() {
-        let players = vec![v(T0513_01, "p1")];
-        let alliances = vec![v(T0513_01, "a1"), v(T0522_01, "a2")];
+    fn timeline_has_one_point_per_slot_at_its_newest_version() {
+        // the first slot holds hourly versions from before the slot throttle
+        let players = vec![v(T0513_01, "p1"), v(T0513_01 + SLOT, "p2")];
+        let alliances = vec![v(T0513_01, "a1"), v(T0522_01 + SLOT, "a2")];
         let towns = vec![v(T0513_02, "t1"), v(T0522_01, "t2")];
         assert_eq!(
             timeline_points(&[players, alliances, towns], true),
-            vec![T0513_02, T0522_01]
+            vec![T0522_01, T0522_01 + SLOT]
         );
     }
 
     #[test]
     fn timeline_needs_every_file_and_islands() {
-        let players = vec![v(T0522_01, "p1")];
+        let players = vec![v(T0522_01 + SLOT, "p1")];
         let alliances = vec![v(T0513_01, "a1")];
-        let towns = vec![v(T0513_02, "t1")];
+        let towns = vec![v(T0513_02, "t1"), v(T0513_02 + SLOT, "t2")];
         let per_file = [players, alliances, towns];
-        assert_eq!(timeline_points(&per_file, true), vec![T0522_01]);
+        assert_eq!(timeline_points(&per_file, true), vec![T0522_01 + SLOT]);
         assert!(timeline_points(&per_file, false).is_empty());
     }
 
@@ -319,12 +330,15 @@ mod tests {
         let changed = b"1,a,0\n2,b,5\n";
         assert_eq!(archive.record("us145", "towns.txt", T0513_02, first).await.unwrap(), RecordOutcome::Stored);
         assert_eq!(archive.record("us145", "towns.txt", T0522_01, reordered).await.unwrap(), RecordOutcome::Duplicate);
-        assert_eq!(archive.record("us145", "towns.txt", T0522_01, changed).await.unwrap(), RecordOutcome::Stored);
+        assert_eq!(archive.record("us145", "towns.txt", T0522_01, changed).await.unwrap(), RecordOutcome::Throttled);
+        let next_slot = T0513_02 + SLOT;
+        assert_eq!(archive.record("us145", "towns.txt", next_slot, changed).await.unwrap(), RecordOutcome::Stored);
+        assert_eq!(archive.record("us145", "towns.txt", T0522_01, b"from a lagging node\n").await.unwrap(), RecordOutcome::Throttled);
 
         let newest = archive.newest("us145", "towns.txt").await.unwrap();
-        assert_eq!(newest.lm, T0522_01);
+        assert_eq!(newest.lm, next_slot);
         assert_eq!(archive.read_plain(&newest).await.unwrap().as_ref(), changed);
-        let older = archive.at("us145", "towns.txt", T0522_01 - 1).await.unwrap();
+        let older = archive.at("us145", "towns.txt", next_slot - 1).await.unwrap();
         assert_eq!(archive.read_plain(&older).await.unwrap().as_ref(), first);
 
         let day = ISLANDS_MIN_INTERVAL_SECS;

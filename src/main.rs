@@ -27,9 +27,8 @@ use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
 const CACHE_EXPIRY: Duration = Duration::from_secs(15 * 60); // 15 minutes
-/// `/capture` refetches anything older than this. With the normal 15 minute expiry, a
-/// scheduler pinging every 15 minutes would often find the cache just barely fresh and
-/// only actually capture on every other ping.
+/// `/capture` refetches anything older than this, so a scheduled capture always checks
+/// upstream instead of archiving whatever a visitor happened to leave in the cache.
 const CAPTURE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 const MAX_FILES_IN_RAM_CACHE: usize = 25;
 lazy_static! {
@@ -112,6 +111,8 @@ impl AppState {
 struct CacheEntry {
     data: Bytes,
     timestamp: Instant,
+    /// upstream `Last-Modified` in unix seconds, 0 if unknown
+    last_modified: u64,
 }
 
 #[derive(Deserialize)]
@@ -233,7 +234,8 @@ async fn get_live(
     // Check if response is cached on disk
     if let Some(data) = get_from_disk_cache(state, &cache_key, max_age).await {
         info!(result = "success", reason = "file cache", server, datafile);
-        update_ram_cache(state, &cache_key, &data).await;
+        // the disk cache doesn't record Last-Modified
+        update_ram_cache(state, &cache_key, &data, 0).await;
         return Ok(data);
     }
     // Fetch from the external API
@@ -242,9 +244,11 @@ async fn get_live(
         info!(result = "fail", reason = "upstream", server, datafile);
         return Err(StatusCode::BAD_GATEWAY);
     };
-    let data = archive_and_pick_newest(state, server, datafile, last_modified, data).await;
+    let (data, last_modified) =
+        archive_and_pick_newest(state, server, datafile, last_modified, data).await;
+    let (data, last_modified) = keep_newer_cached(state, &cache_key, data, last_modified).await;
     update_disk_cache(state, &cache_key, &data).await;
-    update_ram_cache(state, &cache_key, &data).await;
+    update_ram_cache(state, &cache_key, &data, last_modified).await;
     info!(result = "success", reason = "upstream", server, datafile);
     Ok(data)
 }
@@ -257,9 +261,9 @@ async fn archive_and_pick_newest(
     datafile: &str,
     last_modified: u64,
     data: Bytes,
-) -> Bytes {
+) -> (Bytes, u64) {
     let Some(archive) = &state.archive else {
-        return data;
+        return (data, last_modified);
     };
     match archive.record(server, datafile, last_modified, &data).await {
         Ok(outcome) => info!(archive = ?outcome, last_modified, server, datafile),
@@ -268,12 +272,30 @@ async fn archive_and_pick_newest(
     if let Some(newest) = archive.newest(server, datafile).await {
         if newest.lm > last_modified {
             match archive.read_plain(&newest).await {
-                Ok(newer) => return newer,
+                Ok(newer) => return (newer, newest.lm),
                 Err(err) => warn!(archive = "error", %err, server, datafile),
             }
         }
     }
-    data
+    (data, last_modified)
+}
+
+/// The archive keeps only one version per 6-hour slot, so it can't stop a lagging node's copy
+/// from replacing a newer one fetched earlier in the slot. The RAM cache still holds what this
+/// instance served last, even once expired; keep serving that if it's newer.
+async fn keep_newer_cached(
+    state: &AppState,
+    cache_key: &str,
+    data: Bytes,
+    last_modified: u64,
+) -> (Bytes, u64) {
+    let cache = state.cache.read().await;
+    match cache.get(cache_key) {
+        Some(entry) if entry.last_modified > last_modified => {
+            (entry.data.clone(), entry.last_modified)
+        }
+        _ => (data, last_modified),
+    }
 }
 
 async fn get_from_ram_cache(state: &AppState, cache_key: &str, max_age: Duration) -> Option<Bytes> {
@@ -336,7 +358,7 @@ async fn fetch_upstream(state: &AppState, server: &str, datafile: &str) -> Optio
     Some((data, last_modified))
 }
 
-async fn update_ram_cache(state: &AppState, cache_key: &str, data: &Bytes) {
+async fn update_ram_cache(state: &AppState, cache_key: &str, data: &Bytes, last_modified: u64) {
     let mut cache = state.cache.write().await;
     // If the cache exceeds MAX_FILES_IN_RAM_CACHE, remove the least recently used entry
     if cache.len() >= MAX_FILES_IN_RAM_CACHE {
@@ -355,6 +377,7 @@ async fn update_ram_cache(state: &AppState, cache_key: &str, data: &Bytes) {
         CacheEntry {
             data: data.clone(),
             timestamp: Instant::now(),
+            last_modified,
         },
     );
 }
