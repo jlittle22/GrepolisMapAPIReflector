@@ -12,11 +12,14 @@
 //! 515 302.8
 //! rings 8fc73eff 3.6 2
 //! 515 302.8
+//! polys 5870801a 587080ff 1
+//! 500 290 530 288 534 310 502 315
 //! logo 8 8 46.7 48
 //! ```
 //!
 //! `line` is axis-aligned, with an optional dash and gap length. `dots` and `rings` apply to
-//! the `X Y` lines that follow them. Colors are `RRGGBBAA`.
+//! the `X Y` lines that follow them, `polys` (fill, outline color and width) to the lines of
+//! `X Y X Y ...` corners that follow it, one convex polygon each. Colors are `RRGGBBAA`.
 
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha256};
@@ -31,6 +34,10 @@ pub const MAX_SIZE: usize = 2000;
 const MAX_POINTS: usize = 200_000;
 /// most lines one scene may draw
 const MAX_LINES: usize = 1000;
+/// most `polys` polygons one scene may draw
+const MAX_POLYGONS: usize = 50_000;
+/// most corners of one polygon
+const MAX_CORNERS: usize = 64;
 
 lazy_static! {
     static ref LOGO: Option<RgbaImage> =
@@ -53,6 +60,8 @@ enum Points {
     None,
     Dots(Rgba, f32),
     Rings(Rgba, f32, f32),
+    /// fill, outline color and width
+    Polygons(Rgba, Rgba, f32),
 }
 
 /// Render `scene` to a PNG. `Err` says what's wrong with it.
@@ -77,7 +86,7 @@ pub fn render(scene: &str) -> Result<Vec<u8>, String> {
     };
 
     let mut points = Points::None;
-    let (mut point_count, mut line_count) = (0, 0);
+    let (mut point_count, mut line_count, mut polygon_count) = (0, 0, 0);
 
     for (number, line) in lines.enumerate() {
         let fail = |what: &str| format!("line {}: {what}", number + 3);
@@ -110,6 +119,14 @@ pub fn render(scene: &str) -> Result<Vec<u8>, String> {
                     width.min(20.0),
                 );
             }
+            ["polys", fill, stroke, width] => {
+                let [width] = numbers([width]).ok_or_else(|| fail("bad polys"))?;
+                points = Points::Polygons(
+                    color(fill).map_err(|e| fail(&e))?,
+                    color(stroke).map_err(|e| fail(&e))?,
+                    width.min(20.0),
+                );
+            }
             ["logo", x, y, w, h] => {
                 let [x, y, w, h] = numbers([x, y, w, h]).ok_or_else(|| fail("bad logo"))?;
                 #[allow(clippy::cast_precision_loss)]
@@ -117,6 +134,18 @@ pub fn render(scene: &str) -> Result<Vec<u8>, String> {
                 if let Some(logo) = LOGO.as_ref() {
                     canvas.image(logo, x, y, w.min(max), h.min(max));
                 }
+            }
+            ref corners if matches!(points, Points::Polygons(..)) => {
+                let Points::Polygons(fill, stroke, width) = points else {
+                    unreachable!()
+                };
+                polygon_count += 1;
+                if polygon_count > MAX_POLYGONS {
+                    return Err(fail("too many polygons"));
+                }
+                let corner_points = corners_of(corners)
+                    .ok_or_else(|| fail("a polygon needs 3 or more `X Y` corners"))?;
+                canvas.polygon(&corner_points, fill, stroke, width);
             }
             [x, y] => {
                 point_count += 1;
@@ -128,6 +157,7 @@ pub fn render(scene: &str) -> Result<Vec<u8>, String> {
                     Points::None => return Err(fail("point before `dots` or `rings`")),
                     Points::Dots(rgba, radius) => canvas.disc(x, y, radius, rgba),
                     Points::Rings(rgba, radius, width) => canvas.ring(x, y, radius, width, rgba),
+                    Points::Polygons(..) => unreachable!("handled above"),
                 }
             }
             [""] => {}
@@ -135,6 +165,18 @@ pub fn render(scene: &str) -> Result<Vec<u8>, String> {
         }
     }
     canvas.png().ok_or_else(|| "failed to encode".to_owned())
+}
+
+/// the corners of a polygon line, `None` unless it's 3 to `MAX_CORNERS` `X Y` pairs
+#[allow(clippy::manual_is_multiple_of)] // is_multiple_of needs Rust 1.87, the image has 1.83
+fn corners_of(words: &[&str]) -> Option<Vec<(f32, f32)>> {
+    if words.len() < 6 || words.len() % 2 != 0 || words.len() > MAX_CORNERS * 2 {
+        return None;
+    }
+    words
+        .chunks(2)
+        .map(|pair| numbers([pair[0], pair[1]]).map(|[x, y]| (x, y)))
+        .collect()
 }
 
 /// parse finite numbers, `None` if any isn't one
@@ -220,7 +262,8 @@ mod tests {
     fn renders_a_scene() {
         let scene = "gtmap-screenshot 1\nsize 64 48 101010\nline 0 10 64 10 2 404040ff\n\
                      line 20 0 20 48 1 404040ff 7 7\ndots b4b4b4ff 1.5\n5 5\n30.5 20\n\
-                     rings 8fc73eff 3 2\n30.5 20\nlogo 2 2 10 10\n";
+                     rings 8fc73eff 3 2\n30.5 20\npolys 5870801a 587080ff 1\n\
+                     40 10 60 12 58 30 42 28\nlogo 2 2 10 10\n";
         let png = render(scene).unwrap();
         assert_eq!(&png[1..4], b"PNG");
     }
@@ -231,6 +274,10 @@ mod tests {
         assert!(render("gtmap-screenshot 1\nsize 5000 10 000000").is_err());
         assert!(render("gtmap-screenshot 1\nsize 10 10 000000\n1 2").is_err());
         assert!(render("gtmap-screenshot 1\nsize 10 10 000000\ndots red 2").is_err());
+        let polys = "gtmap-screenshot 1\nsize 10 10 000000\npolys 000000ff 000000ff 1\n";
+        assert!(render(&format!("{polys}1 2 3 4")).is_err());
+        assert!(render(&format!("{polys}1 2 3 4 5 6 7")).is_err());
+        assert!(render(&format!("{polys}1 2 3 4 5 6")).is_ok());
     }
 
     #[test]

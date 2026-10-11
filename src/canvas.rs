@@ -88,6 +88,60 @@ impl Canvas {
         }
     }
 
+    /// A convex polygon, filled and outlined with `width` centered on its edges, both
+    /// anti-aliased. Either winding works.
+    pub fn polygon(&mut self, points: &[(f32, f32)], fill: Rgba, stroke: Rgba, width: f32) {
+        if points.len() < 3 {
+            return;
+        }
+        let area: f32 = (0..points.len())
+            .map(|i| {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum();
+        if area.abs() < f32::EPSILON {
+            return;
+        }
+        let side = area.signum();
+        // per edge: start point and inward unit normal, so the distance inside is a dot product
+        let edges: Vec<((f32, f32), (f32, f32))> = (0..points.len())
+            .filter_map(|i| {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let length = (dx * dx + dy * dy).sqrt();
+                (length > f32::EPSILON).then(|| (a, (-dy * side / length, dx * side / length)))
+            })
+            .collect();
+        let half = width.max(0.0) / 2.0;
+        let reach = half + 1.0;
+        let (min_x, max_x) = points.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+            (lo.min(p.0), hi.max(p.0))
+        });
+        let (min_y, max_y) = points.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+            (lo.min(p.1), hi.max(p.1))
+        });
+        let x0 = (min_x - reach).floor().max(0.0) as i64;
+        let x1 = (max_x + reach).ceil().min(self.width as f32) as i64;
+        let y0 = (min_y - reach).floor().max(0.0) as i64;
+        let y1 = (max_y + reach).ceil().min(self.height as f32) as i64;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                // signed distance to the outline, positive inside (exact for convex shapes
+                // except just outside the corners, where it's a little short)
+                let distance = edges
+                    .iter()
+                    .map(|((ax, ay), (nx, ny))| (px - ax) * nx + (py - ay) * ny)
+                    .fold(f32::MAX, f32::min);
+                self.blend(x, y, fill, distance + 0.5);
+                if half > 0.0 {
+                    self.blend(x, y, stroke, half + 0.5 - distance.abs());
+                }
+            }
+        }
+    }
+
     /// digits only, in a 3x5 pixel font drawn at twice the size
     pub fn digits(&mut self, x: f32, y: f32, text: &str, color: Rgba) {
         const DIGITS: [[u8; 5]; 10] = [
