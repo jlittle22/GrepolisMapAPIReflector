@@ -1,6 +1,8 @@
 #![warn(clippy::pedantic)]
 
 mod archive;
+mod minimap;
+mod offset_data;
 
 use archive::Archive;
 use axum::{
@@ -17,7 +19,7 @@ use regex::Regex;
 use reqwest::{redirect::Policy, Client};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -31,8 +33,12 @@ const CACHE_EXPIRY: Duration = Duration::from_secs(15 * 60); // 15 minutes
 /// upstream instead of archiving whatever a visitor happened to leave in the cache.
 const CAPTURE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 const MAX_FILES_IN_RAM_CACHE: usize = 25;
+/// most towns a minimap URL may list
+const MAX_MINIMAP_TOWNS: usize = 2000;
 lazy_static! {
     static ref SERVER_REGEX: Regex = Regex::new(r"^[a-zA-Z]{2}\d{1,3}$").unwrap();
+    /// `1868-3135-3503.png`: the town ids to highlight
+    static ref MINIMAP_REGEX: Regex = Regex::new(r"^\d{1,9}(-\d{1,9})*\.png$").unwrap();
     static ref DATAFILE_WHITELIST: Vec<&'static str> =
         vec!["players.txt", "towns.txt", "alliances.txt", "islands.txt"];
 }
@@ -51,6 +57,7 @@ async fn main() {
     let app = Router::new()
         .route("/{server}/history", get(handle_history))
         .route("/{server}/capture", get(handle_capture))
+        .route("/{server}/minimap/{towns}", get(handle_minimap))
         .route("/{server}/{datafile}", get(handle_request))
         .layer(
             CorsLayer::new()
@@ -189,6 +196,53 @@ async fn handle_capture(
         StatusCode::NO_CONTENT
     } else {
         StatusCode::BAD_GATEWAY
+    }
+}
+
+/// A PNG minimap of the current data zoomed to the given towns, see `minimap::render`.
+async fn handle_minimap(
+    Path((server, towns)): Path<(String, String)>,
+    Extension(state): Extension<Arc<AppState>>,
+) -> Response<Body> {
+    if !SERVER_REGEX.is_match(&server) || !MINIMAP_REGEX.is_match(&towns) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let selected: HashSet<u32> = towns
+        .trim_end_matches(".png")
+        .split('-')
+        .filter_map(|id| id.parse().ok())
+        .collect();
+    if selected.len() > MAX_MINIMAP_TOWNS {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let (towns_txt, islands_txt) = tokio::join!(
+        get_live(&state, &server, "towns.txt", CACHE_EXPIRY),
+        get_live(&state, &server, "islands.txt", CACHE_EXPIRY),
+    );
+    let (Ok((towns_txt, _)), Ok((islands_txt, _))) = (towns_txt, islands_txt) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    let towns_txt = String::from_utf8_lossy(&towns_txt);
+    let islands_txt = String::from_utf8_lossy(&islands_txt);
+    match minimap::render(&towns_txt, &islands_txt, &selected) {
+        Some(png) => {
+            info!(
+                result = "success",
+                reason = "minimap",
+                server,
+                towns = selected.len()
+            );
+            (
+                [
+                    (header::CONTENT_TYPE, "image/png"),
+                    // towns rarely move, and forums may fetch the image on every view
+                    (header::CACHE_CONTROL, "public, max-age=3600"),
+                ],
+                png,
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
