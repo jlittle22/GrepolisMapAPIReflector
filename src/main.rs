@@ -7,7 +7,7 @@ use axum::{
     body::Body,
     extract::{Path, Query},
     http::{header, HeaderValue, Method, Response, StatusCode},
-    response::IntoResponse,
+    response::{AppendHeaders, IntoResponse},
     routing::get,
     Extension, Json, Router,
 };
@@ -54,7 +54,11 @@ async fn main() {
         .route("/{server}/{datafile}", get(handle_request))
         .layer(
             CorsLayer::new()
-                .allow_origin("https://map.grasstouchers.gg".parse::<HeaderValue>().unwrap())
+                .allow_origin(
+                    "https://map.grasstouchers.gg"
+                        .parse::<HeaderValue>()
+                        .unwrap(),
+                )
                 .allow_methods([Method::GET]),
         )
         .layer(Extension(app_state));
@@ -144,7 +148,9 @@ async fn handle_request(
         return snapshot_at(&state, &server, &datafile, at).await;
     }
     match get_live(&state, &server, &datafile, CACHE_EXPIRY).await {
-        Ok(data) => (StatusCode::OK, data).into_response(),
+        Ok((data, last_modified)) => {
+            (StatusCode::OK, last_modified_header(last_modified), data).into_response()
+        }
         Err(status) => status.into_response(),
     }
 }
@@ -200,6 +206,7 @@ async fn snapshot_at(state: &AppState, server: &str, datafile: &str, at: u64) ->
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
                 (header::CONTENT_ENCODING, "gzip"),
             ],
+            last_modified_header(version.lm),
             gz,
         )
             .into_response(),
@@ -215,7 +222,7 @@ async fn get_live(
     server: &str,
     datafile: &str,
     max_age: Duration,
-) -> Result<Bytes, StatusCode> {
+) -> Result<(Bytes, u64), StatusCode> {
     let cache_key = format!("{server}/{datafile}");
 
     // Check if there is a cached failure
@@ -227,16 +234,15 @@ async fn get_live(
     }
 
     // Check if response is cached in RAM
-    if let Some(data) = get_from_ram_cache(state, &cache_key, max_age).await {
+    if let Some(cached) = get_from_ram_cache(state, &cache_key, max_age).await {
         info!(result = "success", reason = "ram cache", server, datafile);
-        return Ok(data);
+        return Ok(cached);
     }
     // Check if response is cached on disk
-    if let Some(data) = get_from_disk_cache(state, &cache_key, max_age).await {
+    if let Some((data, last_modified)) = get_from_disk_cache(state, &cache_key, max_age).await {
         info!(result = "success", reason = "file cache", server, datafile);
-        // the disk cache doesn't record Last-Modified
-        update_ram_cache(state, &cache_key, &data, 0).await;
-        return Ok(data);
+        update_ram_cache(state, &cache_key, &data, last_modified).await;
+        return Ok((data, last_modified));
     }
     // Fetch from the external API
     let Some((data, last_modified)) = fetch_upstream(state, server, datafile).await else {
@@ -247,10 +253,20 @@ async fn get_live(
     let (data, last_modified) =
         archive_and_pick_newest(state, server, datafile, last_modified, data).await;
     let (data, last_modified) = keep_newer_cached(state, &cache_key, data, last_modified).await;
-    update_disk_cache(state, &cache_key, &data).await;
+    update_disk_cache(state, &cache_key, &data, last_modified).await;
     update_ram_cache(state, &cache_key, &data, last_modified).await;
     info!(result = "success", reason = "upstream", server, datafile);
-    Ok(data)
+    Ok((data, last_modified))
+}
+
+/// `Last-Modified` for a copy upstream generated at `last_modified` (unix seconds), if known.
+fn last_modified_header(last_modified: u64) -> AppendHeaders<Option<(header::HeaderName, String)>> {
+    AppendHeaders((last_modified > 0).then(|| {
+        (
+            header::LAST_MODIFIED,
+            httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(last_modified)),
+        )
+    }))
 }
 
 /// Upstream round-robins between nodes that regenerate at different times, so a fetch can
@@ -298,18 +314,26 @@ async fn keep_newer_cached(
     }
 }
 
-async fn get_from_ram_cache(state: &AppState, cache_key: &str, max_age: Duration) -> Option<Bytes> {
+async fn get_from_ram_cache(
+    state: &AppState,
+    cache_key: &str,
+    max_age: Duration,
+) -> Option<(Bytes, u64)> {
     let cache = state.cache.read().await;
     if let Some(entry) = cache.get(cache_key) {
         if entry.timestamp.elapsed() < max_age {
             // Cache hit
-            return Some(entry.data.clone());
+            return Some((entry.data.clone(), entry.last_modified));
         }
     }
     None
 }
 
-async fn get_from_disk_cache(state: &AppState, cache_key: &str, max_age: Duration) -> Option<Bytes> {
+async fn get_from_disk_cache(
+    state: &AppState,
+    cache_key: &str,
+    max_age: Duration,
+) -> Option<(Bytes, u64)> {
     let cache_path = state.cache_dir.join(cache_key);
     if let Ok(metadata) = fs::metadata(&cache_path).await {
         if metadata.is_file() {
@@ -317,7 +341,12 @@ async fn get_from_disk_cache(state: &AppState, cache_key: &str, max_age: Duratio
                 if let Ok(elapsed) = modified.elapsed() {
                     if elapsed < max_age {
                         if let Ok(data) = fs::read(&cache_path).await {
-                            return Some(Bytes::from(data));
+                            let last_modified = fs::read_to_string(last_modified_path(&cache_path))
+                                .await
+                                .ok()
+                                .and_then(|text| text.trim().parse().ok())
+                                .unwrap_or(0);
+                            return Some((Bytes::from(data), last_modified));
                         }
                     }
                 }
@@ -382,10 +411,20 @@ async fn update_ram_cache(state: &AppState, cache_key: &str, data: &Bytes, last_
     );
 }
 
-async fn update_disk_cache(state: &AppState, cache_key: &str, data: &Bytes) {
+async fn update_disk_cache(state: &AppState, cache_key: &str, data: &Bytes, last_modified: u64) {
     let cache_path = state.cache_dir.join(cache_key);
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).await.ok();
     }
+    fs::write(last_modified_path(&cache_path), last_modified.to_string())
+        .await
+        .ok();
     fs::write(cache_path, data).await.ok();
+}
+
+/// The disk cache keeps each file's `Last-Modified` next to it, in `FILE.last-modified`.
+fn last_modified_path(cache_path: &std::path::Path) -> PathBuf {
+    let mut path = cache_path.as_os_str().to_owned();
+    path.push(".last-modified");
+    path.into()
 }
