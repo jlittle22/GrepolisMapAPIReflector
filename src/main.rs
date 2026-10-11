@@ -1,16 +1,18 @@
 #![warn(clippy::pedantic)]
 
 mod archive;
+mod canvas;
 mod minimap;
 mod offset_data;
+mod screenshot;
 
 use archive::Archive;
 use axum::{
     body::Body,
-    extract::{Path, Query},
+    extract::{DefaultBodyLimit, Path, Query},
     http::{header, HeaderValue, Method, Response, StatusCode},
     response::{AppendHeaders, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Extension, Json, Router,
 };
 use bytes::Bytes;
@@ -33,12 +35,16 @@ const CACHE_EXPIRY: Duration = Duration::from_secs(15 * 60); // 15 minutes
 /// upstream instead of archiving whatever a visitor happened to leave in the cache.
 const CAPTURE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 const MAX_FILES_IN_RAM_CACHE: usize = 25;
+/// largest screenshot scene accepted, in bytes
+const MAX_SCREENSHOT_SCENE: usize = 8 * 1024 * 1024;
 /// most towns a minimap URL may list
 const MAX_MINIMAP_TOWNS: usize = 2000;
 lazy_static! {
     static ref SERVER_REGEX: Regex = Regex::new(r"^[a-zA-Z]{2}\d{1,3}$").unwrap();
     /// `1868-3135-3503.png`: the town ids to highlight
     static ref MINIMAP_REGEX: Regex = Regex::new(r"^\d{1,9}(-\d{1,9})*\.png$").unwrap();
+    /// `0123456789abcdef.png`, see `screenshot::id`
+    static ref SCREENSHOT_REGEX: Regex = Regex::new(r"^[0-9a-f]{16}\.png$").unwrap();
     static ref DATAFILE_WHITELIST: Vec<&'static str> =
         vec!["players.txt", "towns.txt", "alliances.txt", "islands.txt"];
 }
@@ -55,6 +61,11 @@ async fn main() {
 
     // Build our application with a route
     let app = Router::new()
+        .route(
+            "/screenshots",
+            post(handle_screenshot_upload).layer(DefaultBodyLimit::max(MAX_SCREENSHOT_SCENE)),
+        )
+        .route("/screenshots/{file}", get(handle_screenshot))
         .route("/{server}/history", get(handle_history))
         .route("/{server}/capture", get(handle_capture))
         .route("/{server}/minimap/{towns}", get(handle_minimap))
@@ -66,7 +77,7 @@ async fn main() {
                         .parse::<HeaderValue>()
                         .unwrap(),
                 )
-                .allow_methods([Method::GET]),
+                .allow_methods([Method::GET, Method::POST]),
         )
         .layer(Extension(app_state));
 
@@ -86,6 +97,8 @@ struct AppState {
     failed_cache: RwLock<HashMap<String, Instant>>,
     client: Client,
     cache_dir: PathBuf,
+    /// rendered screenshots, `ID.png`
+    screenshot_dir: PathBuf,
     archive: Option<Archive>,
 }
 
@@ -109,11 +122,18 @@ impl AppState {
         if archive.is_none() {
             info!("SNAPSHOT_DIR not set, snapshot archiving disabled");
         }
+        // next to the archive so screenshots outlive the container, see `SNAPSHOT_DIR`
+        let screenshot_dir: PathBuf = std::env::var_os("SNAPSHOT_DIR").map_or_else(
+            || "./screenshots".into(),
+            |dir| PathBuf::from(dir).join("screenshots"),
+        );
+        fs::create_dir_all(&screenshot_dir).await.unwrap();
         Self {
             cache: RwLock::new(HashMap::new()),
             failed_cache: RwLock::new(HashMap::new()),
             client,
             cache_dir,
+            screenshot_dir,
             archive,
         }
     }
@@ -196,6 +216,65 @@ async fn handle_capture(
         StatusCode::NO_CONTENT
     } else {
         StatusCode::BAD_GATEWAY
+    }
+}
+
+/// Render a screenshot scene (see `screenshot`) and store it as `ID.png`. Answers with the id,
+/// which the map has already worked out and copied as a link.
+async fn handle_screenshot_upload(
+    Extension(state): Extension<Arc<AppState>>,
+    scene: Bytes,
+) -> Response<Body> {
+    let id = screenshot::id(&scene);
+    let path = state.screenshot_dir.join(format!("{id}.png"));
+    if fs::metadata(&path).await.is_ok() {
+        return (StatusCode::OK, id).into_response();
+    }
+    let Ok(scene) = String::from_utf8(scene.to_vec()) else {
+        return (StatusCode::BAD_REQUEST, "scene isn't UTF-8").into_response();
+    };
+    let png = match tokio::task::spawn_blocking(move || screenshot::render(&scene)).await {
+        Ok(Ok(png)) => png,
+        Ok(Err(reason)) => {
+            warn!(result = "fail", reason = "bad screenshot scene", %reason);
+            return (StatusCode::BAD_REQUEST, reason).into_response();
+        }
+        Err(err) => {
+            warn!(result = "fail", reason = "screenshot render panicked", %err);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if let Err(err) = fs::write(&path, &png).await {
+        warn!(result = "fail", reason = "screenshot write", %err, id);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    info!(
+        result = "success",
+        reason = "screenshot stored",
+        id,
+        bytes = png.len()
+    );
+    (StatusCode::CREATED, id).into_response()
+}
+
+async fn handle_screenshot(
+    Path(file): Path<String>,
+    Extension(state): Extension<Arc<AppState>>,
+) -> Response<Body> {
+    if !SCREENSHOT_REGEX.is_match(&file) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match fs::read(state.screenshot_dir.join(&file)).await {
+        Ok(png) => (
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                // the id is the scene's hash, so a stored screenshot never changes
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            png,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

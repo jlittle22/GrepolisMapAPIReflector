@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::canvas::{Canvas, Rgba};
 use crate::offset_data::OFFSET_DATA;
 
 /// width and height of the image in pixels
@@ -13,12 +14,12 @@ const OCEAN: f32 = 100.0;
 const MIN_SPAN: f32 = 40.0;
 
 const BACKGROUND: [u8; 3] = [22, 34, 46];
-const OCEAN_LINE: [u8; 3] = [44, 62, 80];
-const OCEAN_LABEL: [u8; 3] = [92, 116, 138];
-const OTHER_TOWN: [u8; 3] = [96, 110, 122];
-const SELECTED_OUTLINE: [u8; 3] = [16, 24, 32];
+const OCEAN_LINE: Rgba = [44, 62, 80, 255];
+const OCEAN_LABEL: Rgba = [92, 116, 138, 255];
+const OTHER_TOWN: Rgba = [96, 110, 122, 255];
+const SELECTED_OUTLINE: Rgba = [16, 24, 32, 255];
 /// the map's selection green, sampled from the Grass Touchers logo
-const SELECTED: [u8; 3] = [143, 199, 62];
+const SELECTED: Rgba = [143, 199, 62, 255];
 
 /// Render the towns of `towns_txt` (placed using `islands_txt`) zoomed to the towns in
 /// `selected`, which are highlighted. `None` if none of `selected` exist.
@@ -40,10 +41,11 @@ pub fn render(towns_txt: &str, islands_txt: &str, selected: &HashSet<u32>) -> Op
     let left = ((min_x + max_x - span) / 2.0).clamp(0.0, 1000.0 - span);
     let top = ((min_y + max_y - span) / 2.0).clamp(0.0, 1000.0 - span);
     #[allow(clippy::cast_precision_loss)]
-    let scale = SIZE as f32 / span;
+    let size = SIZE as f32;
+    let scale = size / span;
     let to_px = |x: f32, y: f32| ((x - left) * scale, (y - top) * scale);
 
-    let mut image = Image::new(BACKGROUND);
+    let mut image = Canvas::new(SIZE, SIZE, BACKGROUND);
 
     // ocean grid, then the towns, then ocean numbers (e.g. "44" for x 400..500, y 400..500)
     // so the numbers stay readable over busy oceans
@@ -53,8 +55,8 @@ pub fn render(towns_txt: &str, islands_txt: &str, selected: &HashSet<u32>) -> Op
         let mut oy = (top / OCEAN).floor();
         while oy * OCEAN < top + span {
             let (px, py) = to_px(ox * OCEAN, oy * OCEAN);
-            image.vline(px, OCEAN_LINE);
-            image.hline(py, OCEAN_LINE);
+            image.rect(px - 0.5, 0.0, px + 0.5, size, OCEAN_LINE);
+            image.rect(0.0, py - 0.5, size, py + 0.5, OCEAN_LINE);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let number = (ox as u32) * 10 + oy as u32;
             labels.push((px.max(0.0) + 4.0, py.max(0.0) + 4.0, number.to_string()));
@@ -71,7 +73,7 @@ pub fn render(towns_txt: &str, islands_txt: &str, selected: &HashSet<u32>) -> Op
         }
     }
     for (x, y, text) in &labels {
-        image.text(*x, *y, text, OCEAN_LABEL);
+        image.digits(*x, *y, text, OCEAN_LABEL);
     }
     let radius = (scale * 0.5).clamp(2.5, 5.0);
     for &(x, y) in &picked {
@@ -134,108 +136,4 @@ fn town_positions(towns_txt: &str, islands_txt: &str) -> Vec<(u32, (f32, f32))> 
             Some((id, (f32::from(x) + off_x, f32::from(y) + off_y)))
         })
         .collect()
-}
-
-/// a square RGB canvas of `SIZE` pixels
-struct Image {
-    pixels: Vec<u8>,
-}
-
-#[allow(clippy::cast_possible_wrap)] // SIZE is far below i64::MAX
-impl Image {
-    fn new(color: [u8; 3]) -> Self {
-        Self {
-            pixels: color.repeat(SIZE * SIZE),
-        }
-    }
-
-    fn set(&mut self, x: i64, y: i64, color: [u8; 3]) {
-        let Ok(x) = usize::try_from(x) else { return };
-        let Ok(y) = usize::try_from(y) else { return };
-        if x < SIZE && y < SIZE {
-            let i = (y * SIZE + x) * 3;
-            self.pixels[i..i + 3].copy_from_slice(&color);
-        }
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn vline(&mut self, x: f32, color: [u8; 3]) {
-        for y in 0..SIZE as i64 {
-            self.set(x.round() as i64, y, color);
-        }
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn hline(&mut self, y: f32, color: [u8; 3]) {
-        for x in 0..SIZE as i64 {
-            self.set(x, y.round() as i64, color);
-        }
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn disc(&mut self, cx: f32, cy: f32, radius: f32, color: [u8; 3]) {
-        let r = radius.ceil() as i64;
-        let (x0, y0) = (cx.floor() as i64, cy.floor() as i64);
-        for y in y0 - r..=y0 + r {
-            for x in x0 - r..=x0 + r {
-                #[allow(clippy::cast_precision_loss)]
-                let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-                if dx * dx + dy * dy <= radius * radius {
-                    self.set(x, y, color);
-                }
-            }
-        }
-    }
-
-    /// digits only, in a 3x5 pixel font drawn at twice the size
-    #[allow(clippy::cast_possible_truncation)]
-    fn text(&mut self, x: f32, y: f32, text: &str, color: [u8; 3]) {
-        const DIGITS: [[u8; 5]; 10] = [
-            [0b111, 0b101, 0b101, 0b101, 0b111],
-            [0b010, 0b110, 0b010, 0b010, 0b111],
-            [0b111, 0b001, 0b111, 0b100, 0b111],
-            [0b111, 0b001, 0b111, 0b001, 0b111],
-            [0b101, 0b101, 0b111, 0b001, 0b001],
-            [0b111, 0b100, 0b111, 0b001, 0b111],
-            [0b111, 0b100, 0b111, 0b101, 0b111],
-            [0b111, 0b001, 0b001, 0b001, 0b001],
-            [0b111, 0b101, 0b111, 0b101, 0b111],
-            [0b111, 0b101, 0b111, 0b001, 0b111],
-        ];
-        let (mut x, y) = (x.round() as i64, y.round() as i64);
-        for digit in text.chars().filter_map(|c| c.to_digit(10)) {
-            for (row, bits) in DIGITS[digit as usize].iter().enumerate() {
-                for col in 0..3 {
-                    if bits & (0b100 >> col) != 0 {
-                        let (px, py) = (x + col * 2, y + row as i64 * 2);
-                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            self.set(px + dx, py + dy, color);
-                        }
-                    }
-                }
-            }
-            x += 8;
-        }
-    }
-
-    fn border(&mut self, color: [u8; 3]) {
-        let last = SIZE as i64 - 1;
-        for i in 0..=last {
-            for (x, y) in [(i, 0), (i, last), (0, i), (last, i)] {
-                self.set(x, y, color);
-            }
-        }
-    }
-
-    fn png(&self) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        let size = u32::try_from(SIZE).ok()?;
-        let mut encoder = png::Encoder::new(&mut out, size, size);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().ok()?;
-        writer.write_image_data(&self.pixels).ok()?;
-        writer.finish().ok()?;
-        Some(out)
-    }
 }
